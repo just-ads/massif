@@ -70,6 +70,11 @@ struct Args {
     #[arg(long, allow_hyphen_values = true)]
     nodata: Option<f32>,
 
+    /// Minimum valid elevation value — values below this are treated as nodata.
+    /// Example: --min-valid -100.0  (all elevations < -100 become nodata)
+    #[arg(long, allow_hyphen_values = true)]
+    min_valid: Option<f32>,
+
     /// Worker thread count (default: all CPUs)
     #[arg(short = 'j', long)]
     workers: Option<usize>,
@@ -116,24 +121,19 @@ fn main() -> Result<()> {
     );
 
     // ── Pre-sort tiles by Hilbert ID (PMTiles streaming writer needs order) ────
-    // MBTiles uses SQLite — insertion order doesn't matter, skip the sort.
     let needs_hilbert_sort =
         args.output.extension().and_then(|e| e.to_str()) == Some("pmtiles");
     if needs_hilbert_sort {
         eprintln!("Sorting {} tiles by Hilbert ID…", tiles.len());
-        // sort_by_cached_key computes TileId once per tile (O(n)), not per
-        // comparison (O(n log n)) — significant for millions of tiles.
         tiles.sort_by_cached_key(|&(z, x, y)| {
             TileId::from(TileCoord::new(z, x, y).expect("valid coord")).value()
         });
     }
 
-    // ── Open output writer (container inferred from file extension) ───────────
+    // ── Open output writer ────────────────────────────────────────────────────
     let mut writer = Writer::open(&args.output, args.format, args.min_z, args.max_z)?;
 
-    // ── Parallel tile generation — chunked to bound peak memory ──────────────
-    // Each chunk is processed in parallel and written before the next begins.
-    // Peak RAM ≈ CHUNK_SIZE × avg_tile_size (instead of all tiles at once).
+    // ── Parallel tile generation ──────────────────────────────────────────────
     const CHUNK_SIZE: usize = 4096;
 
     let pb = ProgressBar::new(tiles.len() as u64);
@@ -166,15 +166,24 @@ fn main() -> Result<()> {
     let format = args.format;
     let compress = args.compress;
     let nodata = args.nodata;
+    let min_valid = args.min_valid;
     let mut n_written: u64 = 0;
     let mut n_errors: u64 = 0;
 
     for chunk in tiles.chunks(CHUNK_SIZE) {
-        // par_iter on a slice preserves order → results match chunk order (= Hilbert order)
         let chunk_results: Vec<Result<Option<Vec<u8>>>> = chunk
             .par_iter()
             .map(|&(z, x, y)| {
-                let r = process_tile(&input_str, z, x, y, bv, iv, rd, encoding, format, compress, nodata);
+                let r = process_tile(
+                    &input_str,
+                    z, x, y,
+                    bv, iv, rd,
+                    encoding,
+                    format,
+                    compress,
+                    nodata,
+                    min_valid,       // ← 传入 min_valid
+                );
                 pb.inc(1);
                 r
             })
@@ -195,7 +204,6 @@ fn main() -> Result<()> {
                 }
             }
         }
-        // chunk_results dropped here — memory freed between chunks
     }
 
     pb.finish_with_message("done");
