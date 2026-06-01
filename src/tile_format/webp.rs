@@ -18,7 +18,7 @@ pub fn encode_tile(rgb: &[u8], compress: Option<u8>) -> Result<Vec<u8>> {
     } else {
         let mut buf = Vec::new();
         WebPEncoder::new(&mut buf)
-            .encode(rgb, 512, 512, ColorType::Rgb8)
+            .encode(rgb, 514, 514, ColorType::Rgb8)
             .context("webp encode")?;
         Ok(buf)
     }
