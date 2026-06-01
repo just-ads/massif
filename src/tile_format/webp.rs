@@ -11,7 +11,7 @@ use image_webp::{ColorType, WebPEncoder};
 pub fn encode_tile(rgb: &[u8], compress: Option<u8>) -> Result<Vec<u8>> {
     if let Some(level) = compress {
         let effort = (level - 1) as f32 * 100.0 / 8.0; // 1→0.0, 5→50.0, 9→100.0
-        Ok(webp::Encoder::from_rgb(rgb, 512, 512)
+        Ok(webp::Encoder::from_rgb(rgb, 514, 514)
             .encode_simple(true, effort) // lossless=true, quality=effort
             .unwrap()
             .to_vec())
