@@ -10,6 +10,7 @@ use crate::tile_format::TileFormat;
 use crate::tile::{merc_to_wgs84, tile_bounds_3857, HALF_CIRC};
 
 /// Bilinear sample from a flat f32 buffer. Returns `nodata` if out of bounds.
+/// (unchanged signature – min_valid filtering is done after sampling)
 pub fn sample_bilinear(
     data: &[f32],
     width: usize,
@@ -86,11 +87,6 @@ pub fn dataset_wgs84_bounds(path: &Path) -> Result<(f64, f64, f64, f64)> {
 }
 
 // ── Per-thread dataset cache ──────────────────────────────────────────────────
-// GDAL datasets are not Send, but are safe to reuse on the same thread. Rayon
-// uses a persistent thread pool, so caching here means each worker opens the
-// dataset once rather than once per tile. Especially impactful for VRT inputs
-// where GDAL parses all sub-file references on every open.
-
 struct DatasetCache {
     input_path: String,
     dataset: Dataset,
@@ -143,9 +139,34 @@ fn init_dataset_cache(input_path: &str) -> Result<DatasetCache> {
     })
 }
 
+// ── Helper: elevation filtering and encoding ─────────────────────────────────
+/// If `elev` is below `min_valid`, treat as nodata and return [0,0,0].
+/// Otherwise delegate to the actual encoder.
+fn encode_elev(
+    elev: f32,
+    encoding: Encoding,
+    base_val: f64,
+    interval: f64,
+    round: u32,
+    nodata: f32,
+    min_valid: Option<f32>,
+) -> [u8; 3] {
+    if min_valid.map_or(false, |min| elev < min) {
+        return [0, 0, 0];
+    }
+    match encoding {
+        Encoding::Mapbox => encode_mapbox(elev, base_val, interval, round, nodata),
+        Encoding::Terrarium => encode_terrarium(elev, nodata),
+    }
+}
+
 /// Process one tile; returns `None` if entirely nodata.
 /// Uses a per-thread dataset cache — GDAL datasets are not Send but are safe
 /// to reuse on the same thread across tiles.
+///
+/// # Parameters
+/// - `min_valid`: values below this threshold are treated as nodata.
+///                For example, use `Some(-50.0)` to discard ocean depths below -50 m.
 pub fn process_tile(
     input_path: &str,
     z: u8,
@@ -158,12 +179,12 @@ pub fn process_tile(
     format: TileFormat,
     compress: Option<u8>,
     nodata_override: Option<f32>,
+    min_valid: Option<f32>,   // NEW parameter
 ) -> Result<Option<Vec<u8>>> {
     use gdal::raster::ResampleAlg;
 
     TILE_CACHE.with(|cell| -> Result<Option<Vec<u8>>> {
         // Ensure this thread's cache is warm for the current input path.
-        // The inner scope drops the mutable borrow before we take an immutable one below.
         {
             let mut opt = cell.borrow_mut();
             if opt.as_ref().map_or(true, |c| c.input_path != input_path) {
@@ -182,14 +203,29 @@ pub fn process_tile(
 
         let band = cache.dataset.rasterband(1).context("rasterband 1")?;
 
-        // ── Tile extent in 3857 ───────────────────────────────────────────────
+        // ── Tile extent in 3857 (original 512‑px boundary) ───────────────────
         let [west_m, south_m, east_m, north_m] = tile_bounds_3857(z, x, y_xyz);
 
-        // ── Transform tile corners + midpoints to source SRS for read window ──
-        let mid_x = (west_m + east_m) / 2.0;
-        let mid_y = (south_m + north_m) / 2.0;
-        let mut cx = [west_m, east_m, west_m, east_m, mid_x, west_m, east_m, mid_x];
-        let mut cy = [south_m, south_m, north_m, north_m, mid_y, mid_y, mid_y, south_m];
+        // ── Compute pixel step size (for 512 px) and expand for 1‑px skirt ──
+        const TILE_SIZE: usize = 512;
+        const SKIRT: usize = 1;
+        const GRID_SIZE: usize = TILE_SIZE + 2 * SKIRT;   // 514
+        const N: usize = GRID_SIZE * GRID_SIZE;
+
+        let pw = (east_m - west_m) / (TILE_SIZE as f64);
+        let ph = (north_m - south_m) / (TILE_SIZE as f64);
+
+        // Expanded geographic bounds covering the skirt pixels
+        let west_ext = west_m - pw * (SKIRT as f64);
+        let east_ext = east_m + pw * (SKIRT as f64);
+        let south_ext = south_m - ph * (SKIRT as f64);
+        let north_ext = north_m + ph * (SKIRT as f64);
+
+        // ── Transform expanded corners + midpoints to source SRS ─────────────
+        let mid_x = (west_ext + east_ext) / 2.0;
+        let mid_y = (south_ext + north_ext) / 2.0;
+        let mut cx = [west_ext, east_ext, west_ext, east_ext, mid_x, west_ext, east_ext, mid_x];
+        let mut cy = [south_ext, south_ext, north_ext, north_ext, mid_y, mid_y, mid_y, south_ext];
         if let Some(ref t) = cache.to_src {
             t.transform_coords(&mut cx, &mut cy, &mut [] as &mut [f64])
                 .context("transform corners")?;
@@ -206,15 +242,13 @@ pub fn process_tile(
         let src_y_min = cy.iter().cloned().fold(f64::MAX, f64::min);
         let src_y_max = cy.iter().cloned().fold(f64::MIN, f64::max);
 
-        // ── Convert source-SRS bbox to pixel indices ──────────────────────────
-        // gt: [origin_x, px_width, 0, origin_y, 0, px_height(negative)]
+        // ── Convert to pixel indices ─────────────────────────────────────────
         let px_min = (src_x_min - gt[0]) / gt[1];
         let px_max = (src_x_max - gt[0]) / gt[1];
-        // gt[5] < 0, so larger src_y → smaller py
         let py_min = (src_y_max - gt[3]) / gt[5];
         let py_max = (src_y_min - gt[3]) / gt[5];
 
-        // Expand 1 px for bilinear border; clamp to source bounds
+        // Expand margin for bilinear interpolation; clamp to source bounds
         let rx0 = (px_min.floor() as i64 - 1).clamp(0, src_w as i64 - 1) as usize;
         let ry0 = (py_min.floor() as i64 - 1).clamp(0, src_h as i64 - 1) as usize;
         let rx1 = (px_max.ceil() as i64 + 2).clamp(rx0 as i64 + 1, src_w as i64) as usize;
@@ -223,7 +257,7 @@ pub fn process_tile(
         let rw = rx1 - rx0;
         let rh = ry1 - ry0;
 
-        // Cap buffer to 2048 — GDAL bilinear-resamples if buf_size < window_size
+        // Cap buffer size
         const MAX_BUF: usize = 2048;
         let bw = rw.min(MAX_BUF);
         let bh = rh.min(MAX_BUF);
@@ -242,29 +276,22 @@ pub fn process_tile(
         let sy = bh as f64 / rh as f64;
 
         // ── Early exit: if source buffer is entirely nodata, skip tile ─────
-        let is_nd = |v: f32| (v - nodata).abs() < 0.5 || v.is_nan();
-        if !src_data.iter().any(|&v| !is_nd(v)) {
+        let is_nodata_val = |v: f32| {
+            (v - nodata).abs() < 0.5
+                || v.is_nan()
+                || min_valid.map_or(false, |min| v < min)
+        };
+        if !src_data.iter().any(|&v| !is_nodata_val(v)) {
             return Ok(None);
         }
 
         // ── Build pixel coordinates and sample + encode ──────────────────────
-        const N: usize = 512 * 512;
-        let pw = (east_m - west_m) / 512.0;
-        let ph = (north_m - south_m) / 512.0;
-
         let mut rgb = vec![0u8; N * 3];
         let mut any_valid = false;
 
         if src_is_wgs84 {
             // ── WGS84 fast path: separable lon/lat grid ──────────────────────
-            // The pixel grid is regular in Mercator space, and Mercator→WGS84
-            // is separable: lon depends only on x, lat only on y. So we need
-            // just 512+512 = 1024 coordinate conversions instead of 512×512.
-            //
-            // We also precompute the full geo→buffer-pixel mapping per row/col,
-            // eliminating 262K divisions from the inner loop.
-
-            let scale_x = sx / gt[1]; // combined geo→buffer scale
+            let scale_x = sx / gt[1];
             let off_x = (gt[0] / gt[1] + rx0 as f64) * sx;
             let scale_y = sy / gt[5];
             let off_y = (gt[3] / gt[5] + ry0 as f64) * sy;
@@ -272,34 +299,31 @@ pub fn process_tile(
             let deg_per_merc = 180.0 / HALF_CIRC;
             let pi_over_hc = std::f64::consts::PI / HALF_CIRC;
 
-            // Precompute per-column: Mercator x → lon → buffer pixel x
-            let mut bpx_col = [0.0f64; 512];
-            for col in 0..512usize {
-                let x_m = west_m + (col as f64 + 0.5) * pw;
+            // Precompute per‑column: Mercator x → lon → buffer pixel x
+            let mut bpx_col = [0.0f64; GRID_SIZE];
+            for col in 0..GRID_SIZE {
+                let x_m = west_ext + (col as f64 + 0.5) * pw;
                 let lon = x_m * deg_per_merc;
                 bpx_col[col] = lon * scale_x - off_x;
             }
 
-            // Precompute per-row: Mercator y → lat → buffer pixel y
-            let mut bpy_row = [0.0f64; 512];
-            for row in 0..512usize {
-                let y_m = north_m - (row as f64 + 0.5) * ph;
+            // Precompute per‑row: Mercator y → lat → buffer pixel y
+            let mut bpy_row = [0.0f64; GRID_SIZE];
+            for row in 0..GRID_SIZE {
+                let y_m = north_ext - (row as f64 + 0.5) * ph;
                 let lat = (2.0 * (y_m * pi_over_hc).exp().atan()
                     - std::f64::consts::FRAC_PI_2)
                     .to_degrees();
                 bpy_row[row] = lat * scale_y - off_y;
             }
 
-            // Fused sample + encode — no Vec allocations, no per-pixel trig
-            for row in 0..512usize {
+            // Fused sample + encode – no allocations, no per‑pixel trig
+            for row in 0..GRID_SIZE {
                 let bpy = bpy_row[row];
-                let base = row * 512 * 3;
-                for col in 0..512usize {
+                let base = row * GRID_SIZE * 3;
+                for col in 0..GRID_SIZE {
                     let elev = sample_bilinear(src_data, bw, bh, bpx_col[col], bpy, nodata);
-                    let c = match encoding {
-                        Encoding::Mapbox => encode_mapbox(elev, base_val, interval, round, nodata),
-                        Encoding::Terrarium => encode_terrarium(elev, nodata),
-                    };
+                    let c = encode_elev(elev, encoding, base_val, interval, round, nodata, min_valid);
                     if c != [0, 0, 0] {
                         any_valid = true;
                     }
@@ -310,13 +334,13 @@ pub fn process_tile(
                 }
             }
         } else {
-            // ── General path: full 262K coordinate transform ─────────────────
+            // ── General path: full 262K+ coordinate transform ─────────────────
             let mut px3 = Vec::with_capacity(N);
             let mut py3 = Vec::with_capacity(N);
-            for row in 0..512usize {
-                for col in 0..512usize {
-                    px3.push(west_m + (col as f64 + 0.5) * pw);
-                    py3.push(north_m - (row as f64 + 0.5) * ph);
+            for row in 0..GRID_SIZE {
+                for col in 0..GRID_SIZE {
+                    px3.push(west_ext + (col as f64 + 0.5) * pw);
+                    py3.push(north_ext - (row as f64 + 0.5) * ph);
                 }
             }
             cache
@@ -331,14 +355,12 @@ pub fn process_tile(
                 let bpy = ((py3[i] - gt[3]) / gt[5] - ry0 as f64) * sy;
 
                 let elev = sample_bilinear(src_data, bw, bh, bpx, bpy, nodata);
-                let c = match encoding {
-                    Encoding::Mapbox => encode_mapbox(elev, base_val, interval, round, nodata),
-                    Encoding::Terrarium => encode_terrarium(elev, nodata),
-                };
+                let c = encode_elev(elev, encoding, base_val, interval, round, nodata, min_valid);
                 if c != [0, 0, 0] {
                     any_valid = true;
                 }
-                rgb[i * 3..i * 3 + 3].copy_from_slice(&c);
+                let start = i * 3;
+                rgb[start..start + 3].copy_from_slice(&c);
             }
         }
 
