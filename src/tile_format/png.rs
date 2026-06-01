@@ -15,7 +15,7 @@ pub fn encode_tile(rgb: &[u8], compress: Option<u8>) -> Result<Vec<u8>> {
     };
 
     let mut buf = Vec::new();
-    let mut encoder = png::Encoder::new(&mut buf, 512, 512);
+    let mut encoder = png::Encoder::new(&mut buf, 514, 514);
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(level);
