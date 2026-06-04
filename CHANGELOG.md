@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.0] - 2026-06-04
+
+### Highlights
+
+- Promote massif from the original full tile-list generator to a sparse frontier pipeline: generation starts at `--min-z`, expands only non-empty tiles, and prunes empty in-bounds descendants instead of processing every candidate tile from the initial bounds.
+- Split PMTiles and MBTiles into dedicated generation flows. PMTiles now stages encoded tiles in `{output}.tmp` before a final sorted build, while MBTiles writes directly to SQLite.
+- Add resumable generation. PMTiles resumes from `state.json`, `frontier_zN`, and staged tile files; MBTiles resumes from chunk-committed tiles plus temporary progress/frontier tables.
+- Replace the original per-tile-list progress bar with a single staged progress bar that reports generation/build stage, written tiles, empty tiles, and pruned descendants.
+
+### Added
+
+- Add `--read-buffer-size` to choose 1024 or 2048 source read buffers per tile.
+- Add `--min-valid` support for treating values below a minimum elevation as nodata.
+
+### Performance
+
+- Reduce unnecessary work versus the original `0.1.0` flow by pruning entire empty tile subtrees instead of generating every zoom/x/y candidate tile.
+- Reduce peak chunk memory by streaming tile results through a bounded channel instead of collecting a whole chunk of encoded tile buffers before writing.
+- Reduce PMTiles staging overhead by preparing each zoom write directory once rather than checking/creating it for every tile.
+- Improve low-zoom IO control with `--read-buffer-size 1024`, which can encourage GDAL overview usage earlier and lower per-tile read memory.
+- Keep MBTiles fast while adding resume support by committing chunk transactions and checking existing tiles in batches instead of querying per tile.
+
+### Reliability
+
+- Clip child tile expansion to the bounds-derived tile range at every zoom, so sparse frontier expansion does not drift outside the requested input bounds.
+- Use atomic `.writing` files for PMTiles state/frontier/temp-tile writes and clean stale frontier `.writing` files on resume.
+- Save MBTiles next-frontier state before current-frontier progress to prefer safe reprocessing after crashes.
+- Drop temporary MBTiles progress/frontier tables during finalize so completed MBTiles files do not retain massif helper metadata.
+
 ## [0.1.1] - 2026-03-30
 
 ### Performance
@@ -37,5 +66,6 @@ Initial release.
 - Nodata override (`--nodata`) for rasters with missing or incorrect metadata
 - Any input CRS — automatic reprojection to Web Mercator via GDAL
 
+[1.0.0]: https://github.com/mapriot/massif/releases/tag/v1.0.0
 [0.1.1]: https://github.com/mapriot/massif/releases/tag/v0.1.1
 [0.1.0]: https://github.com/mapriot/massif/releases/tag/v0.1.0

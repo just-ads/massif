@@ -4,7 +4,7 @@ Fast terrain-RGB tile generator from elevation rasters.
 
 Converts GeoTIFF, VRT, or any GDAL-supported elevation raster into Mapbox or Terrarium terrain-RGB tiles, packaged as [PMTiles](https://protomaps.com/docs/pmtiles) or [MBTiles](https://wiki.openstreetmap.org/wiki/MBTiles). Ready to use with MapLibre GL for hillshading and 3D terrain.
 
-Built as a fast Rust replacement for [rio-rgbify](https://github.com/mapbox/rio-rgbify). Uses all CPU cores via [rayon](https://github.com/rayon-rs/rayon), shows real-time progress, and outputs to modern tile containers — no Python overhead, no guessing when it'll finish.
+Built as a fast Rust replacement for [rio-rgbify](https://github.com/mapbox/rio-rgbify). Uses all CPU cores via [rayon](https://github.com/rayon-rs/rayon), prunes empty tile subtrees with a sparse frontier, shows real-time progress, and outputs to modern tile containers — no Python overhead, no guessing when it'll finish.
 
 ## Installation
 
@@ -60,6 +60,12 @@ massif --compress 6 input.tif output.pmtiles
 # MBTiles output — same flags, different extension
 massif --compress 6 input.tif output.mbtiles
 
+# Limit CPU usage on shared machines
+massif --workers 4 input.tif output.pmtiles
+
+# Encourage GDAL overview usage and reduce per-tile read memory
+massif --read-buffer-size 1024 input.tif output.pmtiles
+
 # Terrarium encoding
 massif --encoding terrarium --compress 6 input.tif output.pmtiles
 
@@ -80,7 +86,9 @@ massif --compress 6 -r 5 input.tif output.pmtiles
 | `--min-z` | `5` | Minimum zoom level |
 | `--max-z` | `12` | Maximum zoom level |
 | `--nodata` | *(from raster)* | Override nodata value (e.g. `0`, `-9999`, `-32768`) |
+| `--min-valid` | *(omitted)* | Treat values below this elevation as nodata |
 | `-j, --workers` | all CPUs | Thread count |
+| `--read-buffer-size` | `2048` | Maximum GDAL source read buffer per tile: `1024` or `2048` |
 
 **Mapbox encoding only:**
 
@@ -102,7 +110,22 @@ gdaladdo -ro -r average input.tif 2 4 8 16 32 64 128 256
 gdaladdo -ro -r average merged.vrt 2 4 8 16 32 64 128 256
 ```
 
-Massif (via GDAL) picks up the `.ovr` sidecar automatically. The tradeoff is storage: the `.ovr` file can be as large as the source data itself. If disk space is constrained, skip overviews and run without — massif handles it, just slower.
+Massif (via GDAL) picks up the `.ovr` sidecar automatically. Overview selection depends on the source window size and the requested read buffer size. `--read-buffer-size 1024` usually encourages GDAL to use overviews earlier and reduces per-tile IO/memory; `2048` is more conservative and is the default.
+
+The tradeoff is storage: a full overview pyramid can add roughly one third of the source size when compressed, and more if uncompressed. If disk space is constrained, skip overviews and run without — massif handles it, just slower.
+
+## Progress, pruning, and resume
+
+Massif builds tiles with a sparse frontier instead of precomputing every tile. It starts from `--min-z`; non-empty tiles expand to children, while empty tiles prune their entire in-bounds descendant subtree. This avoids spending time and memory on large nodata regions.
+
+The progress bar uses the bounds-derived candidate tile count as the denominator. A checked non-empty tile advances by 1. An empty tile advances by `1 + pruned descendants`, so large empty areas are reflected immediately in global progress. For PMTiles, generation uses 90% of the bar and the final PMTiles build uses the remaining 10%.
+
+PMTiles and MBTiles support interrupted runs differently:
+
+- PMTiles writes encoded tiles to `{output}.tmp/zN/z_x_y` first, keeps `state.json` and `frontier_zN` files, then builds the final `.pmtiles` after all zooms finish. If interrupted, rerun the same command to resume from the temp directory.
+- MBTiles writes directly to SQLite in chunk transactions. During processing it keeps temporary `massif_progress` and `massif_frontier` tables for resume. These helper tables are dropped during finalization, so completed MBTiles files do not retain massif metadata.
+
+For PMTiles, keep the `.tmp` directory if you want to resume. Delete `{output}.tmp` to force a clean restart.
 
 ## Performance
 
