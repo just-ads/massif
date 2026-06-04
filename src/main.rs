@@ -1,22 +1,45 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressState, ProgressStyle};
-use pmtiles::{TileCoord, TileId};
-use rayon::prelude::*;
 
+mod mbtiles;
 mod container;
 mod encoder;
+mod frontier;
+mod pipeline;
+mod pmtiles;
+mod progress;
 mod raster;
 mod tile;
 mod tile_format;
 
-use container::Writer;
 use encoder::Encoding;
-use raster::{dataset_wgs84_bounds, process_tile};
+use raster::dataset_wgs84_bounds;
 use tile::{lat_to_tile_y_xyz, lon_to_tile_x};
 use tile_format::TileFormat;
+
+fn parse_read_buffer_size(value: &str) -> std::result::Result<usize, String> {
+    match value {
+        "1024" => Ok(1024),
+        "2048" => Ok(2048),
+        _ => Err("read buffer size must be either 1024 or 2048".to_owned()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputKind {
+    Pmtiles,
+    Mbtiles,
+}
+
+fn output_kind(path: &Path) -> Result<OutputKind> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("pmtiles") => Ok(OutputKind::Pmtiles),
+        Some("mbtiles") => Ok(OutputKind::Mbtiles),
+        other => bail!("Unknown output extension {:?} — use .pmtiles or .mbtiles", other),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -24,64 +47,72 @@ use tile_format::TileFormat;
     version,
     about = "Fast terrain-RGB tile generator — converts elevation rasters to PMTiles or MBTiles"
 )]
-struct Args {
+pub(crate) struct Args {
     /// Input elevation raster — GeoTIFF, VRT, or any GDAL-supported format and CRS
-    input: PathBuf,
+    pub(crate) input: PathBuf,
 
     /// Output file — .pmtiles or .mbtiles (container inferred from extension)
-    output: PathBuf,
+    pub(crate) output: PathBuf,
 
     /// Base elevation offset — Mapbox decode: height = base_val + (R·65536+G·256+B) · interval
     #[arg(short = 'b', long, default_value = "-10000", allow_hyphen_values = true)]
-    base_val: f64,
+    pub(crate) base_val: f64,
 
     /// Elevation interval / precision in metres
     #[arg(short = 'i', long, default_value = "0.1")]
-    interval: f64,
+    pub(crate) interval: f64,
 
     /// Zero out the lowest N bits of the encoded integer (rio-rgbify -r)
     #[arg(short = 'r', long, default_value = "3")]
-    round_digits: u32,
+    pub(crate) round_digits: u32,
 
     /// Minimum zoom level to generate
     #[arg(long, default_value = "5")]
-    min_z: u8,
+    pub(crate) min_z: u8,
 
     /// Maximum zoom level to generate
     #[arg(long, default_value = "12")]
-    max_z: u8,
+    pub(crate) max_z: u8,
 
     /// RGB encoding scheme [default: mapbox]
     #[arg(long, value_enum, default_value = "mapbox")]
-    encoding: Encoding,
+    pub(crate) encoding: Encoding,
 
     /// Output tile format [default: webp]
     #[arg(long, value_enum, default_value = "webp")]
-    format: TileFormat,
+    pub(crate) format: TileFormat,
 
     /// Compression level 1–9 (omit for fastest; 6 is a good default).
     /// Higher = smaller file, slower encoding. Format-agnostic — maps to the
     /// best available compressor for the output format.
     #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(u8).range(1..=9))]
-    compress: Option<u8>,
+    pub(crate) compress: Option<u8>,
 
     /// Override the nodata value from the raster metadata.
     /// Useful when the file has no embedded nodata or it is wrong (common values: 0, -9999, -32768).
     #[arg(long, allow_hyphen_values = true)]
-    nodata: Option<f32>,
+    pub(crate) nodata: Option<f32>,
 
     /// Minimum valid elevation value — values below this are treated as nodata.
     /// Example: --min-valid -100.0  (all elevations < -100 become nodata)
     #[arg(long, allow_hyphen_values = true)]
-    min_valid: Option<f32>,
+    pub(crate) min_valid: Option<f32>,
 
     /// Worker thread count (default: all CPUs)
     #[arg(short = 'j', long)]
-    workers: Option<usize>,
+    pub(crate) workers: Option<usize>,
+
+    /// Maximum source read buffer size per tile: 1024 is faster/smaller, 2048 is more conservative.
+    #[arg(long, default_value = "2048", value_parser = parse_read_buffer_size)]
+    pub(crate) read_buffer_size: usize,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.min_z > args.max_z {
+        bail!("--min-z must be <= --max-z");
+    }
 
     if let Some(w) = args.workers {
         rayon::ThreadPoolBuilder::new()
@@ -90,61 +121,30 @@ fn main() -> Result<()> {
             .context("build rayon thread pool")?;
     }
 
+    let output_kind = output_kind(&args.output)?;
     let input_str = args
         .input
         .to_str()
         .context("input path is not valid UTF-8")?
         .to_owned();
 
-    // ── Dataset metadata → WGS84 bounds for tile list ─────────────────────────
     let (west_lon, south_lat, east_lon, north_lat) = dataset_wgs84_bounds(&args.input)?;
 
-    // ── Build tile list ───────────────────────────────────────────────────────
-    let mut tiles: Vec<(u8, u32, u32)> = Vec::new();
+    let mut upper_bound_tiles: usize = 0;
     for z in args.min_z..=args.max_z {
         let x0 = lon_to_tile_x(west_lon, z);
         let x1 = lon_to_tile_x(east_lon, z);
-        let y0 = lat_to_tile_y_xyz(north_lat, z); // smaller y = north
+        let y0 = lat_to_tile_y_xyz(north_lat, z);
         let y1 = lat_to_tile_y_xyz(south_lat, z);
-        for x in x0..=x1 {
-            for y in y0..=y1 {
-                tiles.push((z, x, y));
-            }
-        }
+        upper_bound_tiles += ((x1 - x0 + 1) as usize) * ((y1 - y0 + 1) as usize);
     }
+
     eprintln!(
-        "Zoom {}-{}:  {} candidate tiles  ({} threads)",
+        "Zoom {}-{}: up to {} candidate tiles, sparse frontier enabled ({} threads)",
         args.min_z,
         args.max_z,
-        tiles.len(),
+        upper_bound_tiles,
         rayon::current_num_threads()
-    );
-
-    // ── Pre-sort tiles by Hilbert ID (PMTiles streaming writer needs order) ────
-    let needs_hilbert_sort =
-        args.output.extension().and_then(|e| e.to_str()) == Some("pmtiles");
-    if needs_hilbert_sort {
-        eprintln!("Sorting {} tiles by Hilbert ID…", tiles.len());
-        tiles.sort_by_cached_key(|&(z, x, y)| {
-            TileId::from(TileCoord::new(z, x, y).expect("valid coord")).value()
-        });
-    }
-
-    // ── Open output writer ────────────────────────────────────────────────────
-    let mut writer = Writer::open(&args.output, args.format, args.min_z, args.max_z)?;
-
-    // ── Parallel tile generation ──────────────────────────────────────────────
-    const CHUNK_SIZE: usize = 4096;
-
-    let pb = ProgressBar::new(tiles.len() as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:45.cyan/blue} {pos:>6}/{len} tiles  {tiles_per_sec}/s  eta {eta}",
-        )
-        .unwrap()
-        .with_key("tiles_per_sec", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-            write!(w, "{}", state.per_sec() as u64).unwrap();
-        }),
     );
 
     if args.encoding == Encoding::Terrarium {
@@ -159,66 +159,9 @@ fn main() -> Result<()> {
         }
     }
 
-    let bv = args.base_val;
-    let iv = args.interval;
-    let rd = args.round_digits;
-    let encoding = args.encoding;
-    let format = args.format;
-    let compress = args.compress;
-    let nodata = args.nodata;
-    let min_valid = args.min_valid;
-    let mut n_written: u64 = 0;
-    let mut n_errors: u64 = 0;
-
-    for chunk in tiles.chunks(CHUNK_SIZE) {
-        let chunk_results: Vec<Result<Option<Vec<u8>>>> = chunk
-            .par_iter()
-            .map(|&(z, x, y)| {
-                let r = process_tile(
-                    &input_str,
-                    z, x, y,
-                    bv, iv, rd,
-                    encoding,
-                    format,
-                    compress,
-                    nodata,
-                    min_valid,       // ← 传入 min_valid
-                );
-                pb.inc(1);
-                r
-            })
-            .collect();
-
-        for (i, result) in chunk_results.into_iter().enumerate() {
-            match result {
-                Ok(Some(tile)) => {
-                    let (z, x, y) = chunk[i];
-                    writer.add_tile(z, x, y, &tile).context("add_tile")?;
-                    n_written += 1;
-                }
-                Ok(None) => {} // entirely nodata tile, skip
-                Err(e) => {
-                    let (z, x, y) = chunk[i];
-                    eprintln!("Warning: tile {}/{}/{} failed: {:#}", z, x, y, e);
-                    n_errors += 1;
-                }
-            }
-        }
+    let bounds = (west_lon, south_lat, east_lon, north_lat);
+    match output_kind {
+        OutputKind::Pmtiles => pmtiles::flow::run(&args, &input_str, bounds, upper_bound_tiles),
+        OutputKind::Mbtiles => mbtiles::flow::run(&args, &input_str, bounds, upper_bound_tiles),
     }
-
-    pb.finish_with_message("done");
-    eprintln!("{} non-empty tiles written", n_written);
-    if n_errors > 0 {
-        eprintln!("Warning: {} tiles failed and were skipped", n_errors);
-    }
-
-    writer.finalize().context("finalize")?;
-
-    let sz = std::fs::metadata(&args.output)?.len();
-    eprintln!(
-        "Written {:?}  ({:.1} MB)",
-        args.output,
-        sz as f64 / 1_048_576.0
-    );
-    Ok(())
 }

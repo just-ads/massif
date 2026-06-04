@@ -104,15 +104,19 @@ thread_local! {
 
 fn init_dataset_cache(input_path: &str) -> Result<DatasetCache> {
     let dataset = Dataset::open(input_path).context("open dataset")?;
+
     let gt = dataset.geo_transform().context("geo_transform")?;
     let (src_w, src_h) = dataset.raster_size();
+
     let nodata_base = dataset
         .rasterband(1)
         .context("rasterband 1")?
         .no_data_value()
         .unwrap_or(-32_767.0) as f32;
 
-    let mut src_srs = SpatialRef::from_wkt(&dataset.projection()).context("source SRS")?;
+    let projection = dataset.projection();
+
+    let mut src_srs = SpatialRef::from_wkt(&projection).context("source SRS")?;
     src_srs.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
 
     let src_is_wgs84 = src_srs.is_geographic()
@@ -179,7 +183,8 @@ pub fn process_tile(
     format: TileFormat,
     compress: Option<u8>,
     nodata_override: Option<f32>,
-    min_valid: Option<f32>,   // NEW parameter
+    min_valid: Option<f32>,
+    read_buffer_size: usize,
 ) -> Result<Option<Vec<u8>>> {
     use gdal::raster::ResampleAlg;
 
@@ -221,7 +226,7 @@ pub fn process_tile(
         let south_ext = south_m - ph * (SKIRT as f64);
         let north_ext = north_m + ph * (SKIRT as f64);
 
-        // ── Transform expanded corners + midpoints to source SRS ─────────────
+        // ── Transform tile corners + midpoints to source SRS for read window ─────────────
         let mid_x = (west_ext + east_ext) / 2.0;
         let mid_y = (south_ext + north_ext) / 2.0;
         let mut cx = [west_ext, east_ext, west_ext, east_ext, mid_x, west_ext, east_ext, mid_x];
@@ -257,10 +262,9 @@ pub fn process_tile(
         let rw = rx1 - rx0;
         let rh = ry1 - ry0;
 
-        // Cap buffer size
-        const MAX_BUF: usize = 2048;
-        let bw = rw.min(MAX_BUF);
-        let bh = rh.min(MAX_BUF);
+        // Cap buffer size. Smaller values encourage GDAL to use overviews earlier.
+        let bw = rw.min(read_buffer_size);
+        let bh = rh.min(read_buffer_size);
 
         let buf = band
             .read_as::<f32>(
