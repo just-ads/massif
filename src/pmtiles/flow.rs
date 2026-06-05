@@ -9,6 +9,7 @@ use crate::frontier::{
 use crate::pipeline::{process_tiles_stream, TileOutcome, TileStats};
 use crate::pmtiles::spool;
 use crate::progress::SingleProgress;
+use crate::raster::dataset_wgs84_bounds;
 use crate::Args;
 
 fn state_for(args: &Args, status: &str, current_zoom: u8) -> spool::ResumeState {
@@ -35,6 +36,44 @@ fn validate_state(args: &Args, state: &spool::ResumeState, temp_root: &std::path
             spool::state_path(temp_root)
         );
     }
+    Ok(())
+}
+
+pub(crate) fn build_from_temp(args: &Args) -> Result<()> {
+    let temp_root = spool::temp_root(&args.output);
+    if !temp_root.exists() {
+        bail!("PMTiles temp tile pyramid does not exist: {:?}", temp_root);
+    }
+    if spool::state_path(&temp_root).exists() {
+        let state = spool::read_state(&temp_root)?;
+        validate_state(args, &state, &temp_root)?;
+    }
+
+    let (west_lon, south_lat, east_lon, north_lat) = dataset_wgs84_bounds(&args.input)?;
+    let tile_bounds = bounds_by_zoom(west_lon, south_lat, east_lon, north_lat, args.min_z, args.max_z);
+
+    let total = TileStats::default();
+    spool::write_state(&temp_root, &state_for(args, "writing_pmtiles", args.max_z))?;
+    let written = spool::build_pmtiles_from_temp(
+        &temp_root,
+        &args.output,
+        args.format,
+        args.compress,
+        args.min_z,
+        args.max_z,
+        &tile_bounds,
+        None,
+        &total,
+    )?;
+    spool::write_state(&temp_root, &state_for(args, "done", args.max_z))?;
+
+    let sz = fs::metadata(&args.output)?.len();
+    eprintln!(
+        "Written {:?}  ({:.1} MB, {} tiles)",
+        args.output,
+        sz as f64 / 1_048_576.0,
+        written
+    );
     Ok(())
 }
 
@@ -110,6 +149,7 @@ pub(crate) fn run(
     let mut total = TileStats::default();
     let chunk_size = 4096usize;
     let mut progress = SingleProgress::pmtiles(upper_bound_tiles as u64);
+    let mut uniform_fill_roots = spool::uniform_fill_roots(&temp_root)?;
 
     if !build_pmtiles_only {
         for z in start_zoom..=args.max_z {
@@ -125,14 +165,21 @@ pub(crate) fn run(
 
                 for tile in chunk {
                     if need_restore && z == restore_zoom && existing_encoded.contains(&tile_key(*tile)) {
-                        append_children_in_bounds(*tile, &mut next_frontier, args.max_z, &tile_bounds);
+                        let filled = if uniform_fill_roots.contains(&tile_key(*tile)) {
+                            bounded_descendant_count(*tile, &tile_bounds, args.max_z)
+                        } else {
+                            append_children_in_bounds(*tile, &mut next_frontier, args.max_z, &tile_bounds);
+                            0
+                        };
                         total.add_restored();
-                        total.add_written();
+                        total.add_written_n(1 + filled);
+                        total.add_filled(filled);
                         total.add_checked();
                         zoom.add_restored();
-                        zoom.add_written();
+                        zoom.add_written_n(1 + filled);
+                        zoom.add_filled(filled);
                         zoom.add_checked();
-                        progress.advance_generation(1, z, zoom.checked, frontier.len(), &total);
+                        progress.advance_generation(1 + filled, z, zoom.checked, frontier.len(), &total);
                     } else {
                         work.push(*tile);
                     }
@@ -143,12 +190,28 @@ pub(crate) fn run(
                     zoom.add_checked();
 
                     match result {
-                        TileOutcome::Data { coord, data } => {
-                            append_children_in_bounds(coord, &mut next_frontier, args.max_z, &tile_bounds);
+                        TileOutcome::Data { coord, data, uniform_color } => {
                             spool::write_temp_tile(&temp_root, coord, &data)?;
-                            total.add_written();
-                            zoom.add_written();
-                            progress.advance_generation(1, z, zoom.checked, frontier.len(), &total);
+                            if let Some(color) = uniform_color {
+                                let filled = bounded_descendant_count(coord, &tile_bounds, args.max_z);
+                                if filled > 0 {
+                                    spool::append_uniform_fill(
+                                        &temp_root,
+                                        spool::UniformFill { root: coord, color },
+                                    )?;
+                                    uniform_fill_roots.insert(tile_key(coord));
+                                }
+                                total.add_written_n(1 + filled);
+                                total.add_filled(filled);
+                                zoom.add_written_n(1 + filled);
+                                zoom.add_filled(filled);
+                                progress.advance_generation(1 + filled, z, zoom.checked, frontier.len(), &total);
+                            } else {
+                                append_children_in_bounds(coord, &mut next_frontier, args.max_z, &tile_bounds);
+                                total.add_written();
+                                zoom.add_written();
+                                progress.advance_generation(1, z, zoom.checked, frontier.len(), &total);
+                            }
                         }
                         TileOutcome::Empty { coord } => {
                             let pruned = bounded_descendant_count(coord, &tile_bounds, args.max_z);
@@ -200,14 +263,20 @@ pub(crate) fn run(
         &temp_root,
         &args.output,
         args.format,
+        args.compress,
         args.min_z,
         args.max_z,
+        &tile_bounds,
         Some(&mut progress),
         &total,
     )?;
     progress.finish(&total);
     spool::write_state(&temp_root, &state_for(args, "done", args.max_z))?;
-    fs::remove_dir_all(&temp_root).with_context(|| format!("remove {:?}", temp_root))?;
+    if args.keep_temp {
+        eprintln!("Kept PMTiles temp tile pyramid: {:?}", temp_root);
+    } else {
+        fs::remove_dir_all(&temp_root).with_context(|| format!("remove {:?}", temp_root))?;
+    }
 
     let sz = fs::metadata(&args.output)?.len();
     eprintln!("Written {:?}  ({:.1} MB)", args.output, sz as f64 / 1_048_576.0);

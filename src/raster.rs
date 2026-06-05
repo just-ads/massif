@@ -9,8 +9,18 @@ use crate::encoder::{encode_mapbox, encode_terrarium, Encoding};
 use crate::tile_format::TileFormat;
 use crate::tile::{merc_to_wgs84, tile_bounds_3857, HALF_CIRC};
 
+const TILE_SIZE: usize = 512;
+const SKIRT: usize = 1;
+const GRID_SIZE: usize = TILE_SIZE + 2 * SKIRT;
+const GRID_PIXELS: usize = GRID_SIZE * GRID_SIZE;
+
+pub(crate) struct ProcessedTile {
+    pub(crate) data: Vec<u8>,
+    pub(crate) uniform_color: Option<[u8; 3]>,
+}
+
 /// Bilinear sample from a flat f32 buffer. Returns `nodata` if out of bounds.
-/// (unchanged signature – min_valid filtering is done after sampling)
+/// Elevation thresholding is applied after sampling during encoding.
 pub fn sample_bilinear(
     data: &[f32],
     width: usize,
@@ -144,7 +154,7 @@ fn init_dataset_cache(input_path: &str) -> Result<DatasetCache> {
 }
 
 // ── Helper: elevation filtering and encoding ─────────────────────────────────
-/// If `elev` is below `min_valid`, treat as nodata and return [0,0,0].
+/// If `elev` is below `zero_below`, encode it as elevation 0.
 /// Otherwise delegate to the actual encoder.
 fn encode_elev(
     elev: f32,
@@ -153,14 +163,40 @@ fn encode_elev(
     interval: f64,
     round: u32,
     nodata: f32,
-    min_valid: Option<f32>,
+    zero_below: Option<f32>,
 ) -> [u8; 3] {
-    if min_valid.map_or(false, |min| elev < min) {
-        return [0, 0, 0];
-    }
+    let elev = if (elev - nodata).abs() < 0.5 || elev.is_nan() {
+        elev
+    } else if zero_below.map_or(false, |min| elev < min) {
+        0.0
+    } else {
+        elev
+    };
     match encoding {
         Encoding::Mapbox => encode_mapbox(elev, base_val, interval, round, nodata),
         Encoding::Terrarium => encode_terrarium(elev, nodata),
+    }
+}
+
+fn track_uniform_color(c: [u8; 3], first_color: &mut Option<[u8; 3]>, all_same: &mut bool) {
+    if !*all_same {
+        return;
+    }
+    match *first_color {
+        Some(first) if first != c => *all_same = false,
+        Some(_) => {}
+        None => *first_color = Some(c),
+    }
+}
+
+pub(crate) fn encode_solid_tile(color: [u8; 3], format: TileFormat, compress: Option<u8>) -> Result<Vec<u8>> {
+    let mut rgb = vec![0u8; GRID_PIXELS * 3];
+    for px in rgb.chunks_exact_mut(3) {
+        px.copy_from_slice(&color);
+    }
+    match format {
+        TileFormat::Webp => crate::tile_format::webp::encode_tile(&rgb, compress),
+        TileFormat::Png => crate::tile_format::png::encode_tile(&rgb, compress),
     }
 }
 
@@ -169,8 +205,8 @@ fn encode_elev(
 /// to reuse on the same thread across tiles.
 ///
 /// # Parameters
-/// - `min_valid`: values below this threshold are treated as nodata.
-///                For example, use `Some(-50.0)` to discard ocean depths below -50 m.
+/// - `zero_below`: values below this threshold are encoded as elevation 0.
+///                 For example, use `Some(-50.0)` to encode ocean depths below -50 m as 0.
 pub fn process_tile(
     input_path: &str,
     z: u8,
@@ -183,12 +219,13 @@ pub fn process_tile(
     format: TileFormat,
     compress: Option<u8>,
     nodata_override: Option<f32>,
-    min_valid: Option<f32>,
+    zero_below: Option<f32>,
+    fill_uniform_descendants: bool,
     read_buffer_size: usize,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<ProcessedTile>> {
     use gdal::raster::ResampleAlg;
 
-    TILE_CACHE.with(|cell| -> Result<Option<Vec<u8>>> {
+    TILE_CACHE.with(|cell| -> Result<Option<ProcessedTile>> {
         // Ensure this thread's cache is warm for the current input path.
         {
             let mut opt = cell.borrow_mut();
@@ -212,11 +249,6 @@ pub fn process_tile(
         let [west_m, south_m, east_m, north_m] = tile_bounds_3857(z, x, y_xyz);
 
         // ── Compute pixel step size (for 512 px) and expand for 1‑px skirt ──
-        const TILE_SIZE: usize = 512;
-        const SKIRT: usize = 1;
-        const GRID_SIZE: usize = TILE_SIZE + 2 * SKIRT;   // 514
-        const N: usize = GRID_SIZE * GRID_SIZE;
-
         let pw = (east_m - west_m) / (TILE_SIZE as f64);
         let ph = (north_m - south_m) / (TILE_SIZE as f64);
 
@@ -283,15 +315,16 @@ pub fn process_tile(
         let is_nodata_val = |v: f32| {
             (v - nodata).abs() < 0.5
                 || v.is_nan()
-                || min_valid.map_or(false, |min| v < min)
         };
         if !src_data.iter().any(|&v| !is_nodata_val(v)) {
             return Ok(None);
         }
 
         // ── Build pixel coordinates and sample + encode ──────────────────────
-        let mut rgb = vec![0u8; N * 3];
+        let mut rgb = vec![0u8; GRID_PIXELS * 3];
         let mut any_valid = false;
+        let mut first_color = None;
+        let mut all_same = fill_uniform_descendants;
 
         if src_is_wgs84 {
             // ── WGS84 fast path: separable lon/lat grid ──────────────────────
@@ -327,9 +360,12 @@ pub fn process_tile(
                 let base = row * GRID_SIZE * 3;
                 for col in 0..GRID_SIZE {
                     let elev = sample_bilinear(src_data, bw, bh, bpx_col[col], bpy, nodata);
-                    let c = encode_elev(elev, encoding, base_val, interval, round, nodata, min_valid);
+                    let c = encode_elev(elev, encoding, base_val, interval, round, nodata, zero_below);
                     if c != [0, 0, 0] {
                         any_valid = true;
+                    }
+                    if fill_uniform_descendants {
+                        track_uniform_color(c, &mut first_color, &mut all_same);
                     }
                     let idx = base + col * 3;
                     rgb[idx] = c[0];
@@ -339,8 +375,8 @@ pub fn process_tile(
             }
         } else {
             // ── General path: full 262K+ coordinate transform ─────────────────
-            let mut px3 = Vec::with_capacity(N);
-            let mut py3 = Vec::with_capacity(N);
+            let mut px3 = Vec::with_capacity(GRID_PIXELS);
+            let mut py3 = Vec::with_capacity(GRID_PIXELS);
             for row in 0..GRID_SIZE {
                 for col in 0..GRID_SIZE {
                     px3.push(west_ext + (col as f64 + 0.5) * pw);
@@ -354,14 +390,17 @@ pub fn process_tile(
                 .transform_coords(&mut px3, &mut py3, &mut [])
                 .context("transform pixel grid")?;
 
-            for i in 0..N {
+            for i in 0..GRID_PIXELS {
                 let bpx = ((px3[i] - gt[0]) / gt[1] - rx0 as f64) * sx;
                 let bpy = ((py3[i] - gt[3]) / gt[5] - ry0 as f64) * sy;
 
                 let elev = sample_bilinear(src_data, bw, bh, bpx, bpy, nodata);
-                let c = encode_elev(elev, encoding, base_val, interval, round, nodata, min_valid);
+                let c = encode_elev(elev, encoding, base_val, interval, round, nodata, zero_below);
                 if c != [0, 0, 0] {
                     any_valid = true;
+                }
+                if fill_uniform_descendants {
+                    track_uniform_color(c, &mut first_color, &mut all_same);
                 }
                 let start = i * 3;
                 rgb[start..start + 3].copy_from_slice(&c);
@@ -376,6 +415,7 @@ pub fn process_tile(
             TileFormat::Webp => crate::tile_format::webp::encode_tile(&rgb, compress)?,
             TileFormat::Png => crate::tile_format::png::encode_tile(&rgb, compress)?,
         };
-        Ok(Some(tile))
+        let uniform_color = if all_same { first_color } else { None };
+        Ok(Some(ProcessedTile { data: tile, uniform_color }))
     })
 }

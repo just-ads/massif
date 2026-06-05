@@ -1,12 +1,15 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 
 use anyhow::{Context, Result};
 
 use crate::container::mbtiles::MbtilesWriter;
-use crate::frontier::{bounded_descendant_count, bounds_by_zoom, initial_frontier, tile_key};
+use crate::frontier::{
+    bounded_descendant_count, bounded_descendants, bounds_by_zoom, initial_frontier, tile_key,
+};
 use crate::pipeline::{append_children_unique_in_bounds, process_tiles_stream, TileOutcome, TileStats};
 use crate::progress::SingleProgress;
+use crate::raster::encode_solid_tile;
 use crate::Args;
 
 pub(crate) fn run(
@@ -67,6 +70,7 @@ pub(crate) fn run(
         let mut next_keys: HashSet<u64> = next_frontier.iter().copied().map(tile_key).collect();
         let mut zoom = TileStats::default();
         let mut processed = 0usize;
+        let mut solid_cache: HashMap<[u8; 3], Vec<u8>> = HashMap::new();
         progress.set_generate_stage(z, 0, frontier.len(), &total);
 
         while processed < frontier.len() {
@@ -96,12 +100,39 @@ pub(crate) fn run(
                     zoom.add_checked();
 
                     match result {
-                        TileOutcome::Data { coord, data } => {
+                        TileOutcome::Data { coord, data, uniform_color } => {
                             writer.add_tile(coord.z, coord.x, coord.y, &data).context("add MBTiles tile")?;
-                            append_children_unique_in_bounds(coord, &mut next_frontier, &mut next_keys, args.max_z, &tile_bounds);
-                            total.add_written();
-                            zoom.add_written();
-                            progress.advance_generation(1, z, zoom.checked, frontier.len(), &total);
+                            if let Some(color) = uniform_color {
+                                let descendants = bounded_descendants(coord, &tile_bounds, args.max_z);
+                                let filled = descendants.len() as u64;
+                                if !descendants.is_empty() {
+                                    if !solid_cache.contains_key(&color) {
+                                        solid_cache.insert(color, encode_solid_tile(color, args.format, args.compress)?);
+                                    }
+                                    let solid_data = solid_cache.get(&color).unwrap().clone();
+                                    for child in descendants {
+                                        writer
+                                            .add_tile(child.z, child.x, child.y, &solid_data)
+                                            .context("add MBTiles uniform fill tile")?;
+                                    }
+                                }
+                                total.add_written_n(1 + filled);
+                                total.add_filled(filled);
+                                zoom.add_written_n(1 + filled);
+                                zoom.add_filled(filled);
+                                progress.advance_generation(1 + filled, z, zoom.checked, frontier.len(), &total);
+                            } else {
+                                append_children_unique_in_bounds(
+                                    coord,
+                                    &mut next_frontier,
+                                    &mut next_keys,
+                                    args.max_z,
+                                    &tile_bounds,
+                                );
+                                total.add_written();
+                                zoom.add_written();
+                                progress.advance_generation(1, z, zoom.checked, frontier.len(), &total);
+                            }
                         }
                         TileOutcome::Empty { coord } => {
                             let pruned = bounded_descendant_count(coord, &tile_bounds, args.max_z);

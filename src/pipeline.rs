@@ -9,7 +9,7 @@ use crate::raster::process_tile;
 use crate::Args;
 
 pub(crate) enum TileOutcome {
-    Data { coord: TileJob, data: Vec<u8> },
+    Data { coord: TileJob, data: Vec<u8>, uniform_color: Option<[u8; 3]> },
     Empty { coord: TileJob },
     Error { coord: TileJob, error: anyhow::Error },
 }
@@ -22,6 +22,7 @@ pub(crate) struct TileStats {
     pub(crate) errors: u64,
     pub(crate) restored: u64,
     pub(crate) pruned: u64,
+    pub(crate) filled: u64,
 }
 
 impl TileStats {
@@ -31,6 +32,10 @@ impl TileStats {
 
     pub(crate) fn add_written(&mut self) {
         self.written += 1;
+    }
+
+    pub(crate) fn add_written_n(&mut self, n: u64) {
+        self.written += n;
     }
 
     pub(crate) fn add_empty(&mut self) {
@@ -48,13 +53,17 @@ impl TileStats {
     pub(crate) fn add_pruned(&mut self, n: u64) {
         self.pruned += n;
     }
+
+    pub(crate) fn add_filled(&mut self, n: u64) {
+        self.filled += n;
+    }
 }
 
 pub(crate) fn process_tiles_stream(
     args: &Args,
     input_str: &str,
     work: &[TileJob],
-    mut handle: impl FnMut(TileOutcome) -> Result<()>,
+    mut handle: impl FnMut(TileOutcome) -> Result<()> + Send,
 ) -> Result<()> {
     let (tx, rx) = sync_channel(128);
 
@@ -95,10 +104,15 @@ fn process_tile_job(args: &Args, input_str: &str, tile: TileJob) -> TileOutcome 
         args.format,
         args.compress,
         args.nodata,
-        args.min_valid,
+        args.zero_below,
+        args.fill_uniform_descendants,
         args.read_buffer_size,
     ) {
-        Ok(Some(data)) => TileOutcome::Data { coord: tile, data },
+        Ok(Some(processed)) => TileOutcome::Data {
+            coord: tile,
+            data: processed.data,
+            uniform_color: processed.uniform_color,
+        },
         Ok(None) => TileOutcome::Empty { coord: tile },
         Err(error) => TileOutcome::Error { coord: tile, error },
     }

@@ -124,7 +124,9 @@ pub fn bounded_descendant_count(tile: TileJob, bounds: &[TileBounds], max_z: u8)
         let Some(bounds) = bounds.iter().find(|b| b.z == z) else {
             continue;
         };
-        let scale = 1u64 << (z - tile.z);
+        let Some(scale) = 1u64.checked_shl((z - tile.z) as u32) else {
+            continue;
+        };
         let x0 = tile.x as u64 * scale;
         let x1 = (tile.x as u64 + 1) * scale - 1;
         let y0 = tile.y as u64 * scale;
@@ -139,6 +141,39 @@ pub fn bounded_descendant_count(tile: TileJob, bounds: &[TileBounds], max_z: u8)
         }
     }
     total
+}
+
+pub fn bounded_descendants(tile: TileJob, bounds: &[TileBounds], max_z: u8) -> Vec<TileJob> {
+    if tile.z >= max_z {
+        return Vec::new();
+    }
+
+    let mut descendants = Vec::new();
+    for z in (tile.z + 1)..=max_z {
+        let Some(bounds) = bounds.iter().find(|b| b.z == z) else {
+            continue;
+        };
+        let Some(scale) = 1u64.checked_shl((z - tile.z) as u32) else {
+            continue;
+        };
+        let x0 = tile.x as u64 * scale;
+        let x1 = (tile.x as u64 + 1) * scale - 1;
+        let y0 = tile.y as u64 * scale;
+        let y1 = (tile.y as u64 + 1) * scale - 1;
+
+        let ix0 = x0.max(bounds.x0 as u64);
+        let ix1 = x1.min(bounds.x1 as u64);
+        let iy0 = y0.max(bounds.y0 as u64);
+        let iy1 = y1.min(bounds.y1 as u64);
+        if ix0 <= ix1 && iy0 <= iy1 {
+            for x in ix0..=ix1 {
+                for y in iy0..=iy1 {
+                    descendants.push(TileJob { z, x: x as u32, y: y as u32 });
+                }
+            }
+        }
+    }
+    descendants
 }
 
 pub fn parse_tile_filename(name: &str) -> Option<TileJob> {

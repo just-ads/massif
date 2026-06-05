@@ -11,12 +11,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Promote massif from the original full tile-list generator to a sparse frontier pipeline: generation starts at `--min-z`, expands only non-empty tiles, and prunes empty in-bounds descendants instead of processing every candidate tile from the initial bounds.
 - Split PMTiles and MBTiles into dedicated generation flows. PMTiles now stages encoded tiles in `{output}.tmp` before a final sorted build, while MBTiles writes directly to SQLite.
 - Add resumable generation. PMTiles resumes from `state.json`, `frontier_zN`, and staged tile files; MBTiles resumes from chunk-committed tiles plus temporary progress/frontier tables.
-- Replace the original per-tile-list progress bar with a single staged progress bar that reports generation/build stage, written tiles, empty tiles, and pruned descendants.
+- Replace the original per-tile-list progress bar with a single staged progress bar that reports generation/build stage, written tiles, empty tiles, pruned descendants, and uniform-filled descendants.
 
 ### Added
 
 - Add `--read-buffer-size` to choose 1024 or 2048 source read buffers per tile.
-- Add `--min-valid` support for treating values below a minimum elevation as nodata.
+- Add `--zero-below` support for encoding values below a minimum elevation as 0.
+- Add `--fill-uniform-descendants` to materialize descendants of uniform encoded tiles with a recorded RGB value. This is disabled by default because it is a lossy heuristic: parent-tile uniformity may hide deeper source variation.
 
 ### Performance
 
@@ -25,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Reduce PMTiles staging overhead by preparing each zoom write directory once rather than checking/creating it for every tile.
 - Improve low-zoom IO control with `--read-buffer-size 1024`, which can encourage GDAL overview usage earlier and lower per-tile read memory.
 - Keep MBTiles fast while adding resume support by committing chunk transactions and checking existing tiles in batches instead of querying per tile.
+- Skip intermediate processing for uniform encoded tile subtrees when `--fill-uniform-descendants` is enabled; PMTiles records delayed fill rules, MBTiles fills descendants in the current transaction.
 
 ### Reliability
 
@@ -32,6 +34,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Use atomic `.writing` files for PMTiles state/frontier/temp-tile writes and clean stale frontier `.writing` files on resume.
 - Save MBTiles next-frontier state before current-frontier progress to prefer safe reprocessing after crashes.
 - Drop temporary MBTiles progress/frontier tables during finalize so completed MBTiles files do not retain massif helper metadata.
+- Keep `--zero-below` from converting nodata/NaN samples into elevation 0.
+- Reject `--max-z > 31` because tile coordinates are stored as `u32`; descendant fill also uses checked shifts to avoid overflow.
 
 ## [0.1.1] - 2026-03-30
 

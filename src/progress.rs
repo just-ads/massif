@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use kdam::{tqdm, Bar, BarExt};
 
 use crate::pipeline::TileStats;
@@ -8,6 +10,7 @@ const MBTILES_GENERATE_WEIGHT: usize = 10_000;
 
 pub(crate) struct SingleProgress {
     bar: Bar,
+    started_at: Instant,
     generation_total: u64,
     generation_done: u64,
     generation_weight: usize,
@@ -38,6 +41,7 @@ impl SingleProgress {
         bar.set_description("[init]");
         Self {
             bar,
+            started_at: Instant::now(),
             generation_total: generation_total.max(1),
             generation_done: 0,
             generation_weight,
@@ -99,18 +103,48 @@ impl SingleProgress {
     fn set_stage<T: Into<String>>(&mut self, stage: T, stats: &TileStats) {
         self.bar.set_description(stage);
         self.bar.set_postfix(format!(
-            "written {} empty {} pruned {}",
+            "written {} empty {} pruned {} filled {} elapsed {} eta {} speed {}/s",
             format_count(stats.written),
             format_count(stats.empty),
-            format_count(stats.pruned)
+            format_count(stats.pruned),
+            format_count(stats.filled),
+            format_duration(self.elapsed()),
+            format_duration(self.eta()),
+            format_count(self.speed(stats))
         ));
     }
 
+    fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    fn eta(&self) -> Duration {
+        let position = self.position();
+        if position == 0 {
+            return Duration::ZERO;
+        }
+        let elapsed = self.elapsed().as_secs_f64();
+        let remaining = elapsed * (PROGRESS_SCALE.saturating_sub(position) as f64 / position as f64);
+        Duration::from_secs_f64(remaining.max(0.0))
+    }
+
+    fn speed(&self, stats: &TileStats) -> u64 {
+        let elapsed = self.elapsed().as_secs_f64();
+        if elapsed <= 0.0 {
+            return 0;
+        }
+        (stats.checked as f64 / elapsed).round() as u64
+    }
+
     fn refresh_position(&mut self) {
+        let position = self.position();
+        let _ = self.bar.update_to(position);
+    }
+
+    fn position(&self) -> usize {
         let generation_pos = weighted_position(self.generation_done, self.generation_total, self.generation_weight);
         let build_pos = weighted_position(self.build_done, self.build_total, self.build_weight);
-        let position = (generation_pos + build_pos).min(PROGRESS_SCALE);
-        let _ = self.bar.update_to(position);
+        (generation_pos + build_pos).min(PROGRESS_SCALE)
     }
 }
 
@@ -130,5 +164,19 @@ fn format_count(value: u64) -> String {
         format!("{:.1}K", value as f64 / 1_000.0)
     } else {
         value.to_string()
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if hours > 0 {
+        format!("{}h{:02}m{:02}s", hours, minutes, seconds)
+    } else if minutes > 0 {
+        format!("{}m{:02}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
     }
 }

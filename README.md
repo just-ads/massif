@@ -66,6 +66,9 @@ massif --workers 4 input.tif output.pmtiles
 # Encourage GDAL overview usage and reduce per-tile read memory
 massif --read-buffer-size 1024 input.tif output.pmtiles
 
+# Optional lossy optimization for large uniform encoded regions
+massif --fill-uniform-descendants input.tif output.pmtiles
+
 # Terrarium encoding
 massif --encoding terrarium --compress 6 input.tif output.pmtiles
 
@@ -86,9 +89,12 @@ massif --compress 6 -r 5 input.tif output.pmtiles
 | `--min-z` | `5` | Minimum zoom level |
 | `--max-z` | `12` | Maximum zoom level |
 | `--nodata` | *(from raster)* | Override nodata value (e.g. `0`, `-9999`, `-32768`) |
-| `--min-valid` | *(omitted)* | Treat values below this elevation as nodata |
+| `--zero-below` | *(omitted)* | Encode values below this elevation as 0 |
+| `--fill-uniform-descendants` | `false` | Fill descendants of uniform encoded tiles with the same RGB value; lossy heuristic |
 | `-j, --workers` | all CPUs | Thread count |
 | `--read-buffer-size` | `2048` | Maximum GDAL source read buffer per tile: `1024` or `2048` |
+| `--keep-temp` | `false` | PMTiles only: keep `{output}.tmp` tile pyramid after writing the archive |
+| `--build-from-temp` | `false` | PMTiles only: skip generation and build the archive from existing `{output}.tmp` |
 
 **Mapbox encoding only:**
 
@@ -120,12 +126,21 @@ Massif builds tiles with a sparse frontier instead of precomputing every tile. I
 
 The progress bar uses the bounds-derived candidate tile count as the denominator. A checked non-empty tile advances by 1. An empty tile advances by `1 + pruned descendants`, so large empty areas are reflected immediately in global progress. For PMTiles, generation uses 90% of the bar and the final PMTiles build uses the remaining 10%.
 
+`--fill-uniform-descendants` is an optional lossy optimization for datasets with large regions whose encoded RGB value is constant, such as flat ocean or masked areas. When a processed tile's full encoded 514×514 RGB grid is identical, massif records that RGB value and fills every in-bounds descendant tile with a pure solid tile instead of sampling and encoding the descendants. This can skip large uniform subtrees, but it assumes parent-tile uniformity is acceptable for deeper zooms. Leave it disabled if hidden higher-zoom variation must be preserved.
+
+Uniform fill is handled differently per output format:
+
+- PMTiles writes the current tile to `{output}.tmp`, records a delayed fill rule in `{output}.tmp/uniform_fills`, and materializes the filled descendants during the final PMTiles build. This avoids exploding the temporary tile pyramid.
+- MBTiles writes the current tile and all filled descendants immediately in the same SQLite chunk transaction. If the transaction fails, both the root tile and its filled descendants roll back together.
+
 PMTiles and MBTiles support interrupted runs differently:
 
 - PMTiles writes encoded tiles to `{output}.tmp/zN/z_x_y` first, keeps `state.json` and `frontier_zN` files, then builds the final `.pmtiles` after all zooms finish. If interrupted, rerun the same command to resume from the temp directory.
 - MBTiles writes directly to SQLite in chunk transactions. During processing it keeps temporary `massif_progress` and `massif_frontier` tables for resume. These helper tables are dropped during finalization, so completed MBTiles files do not retain massif metadata.
 
-For PMTiles, keep the `.tmp` directory if you want to resume. Delete `{output}.tmp` to force a clean restart.
+With `--fill-uniform-descendants`, resume remains output-correct. PMTiles persists fill rules and skips child expansion for restored uniform roots when the rule exists; if a crash happens between writing a root tile and recording its fill rule, massif safely falls back to normal child processing for that subtree. MBTiles commits uniform roots and descendants atomically, but resumed runs may still enqueue already-filled descendants for existing-tile checks because MBTiles does not currently persist uniform-root metadata; this affects resume speed and intermediate statistics, not tile correctness.
+
+For PMTiles, use `--keep-temp` to retain the completed `{output}.tmp` tile pyramid after the archive is written. Use `--build-from-temp` to rebuild the `.pmtiles` archive from an existing `{output}.tmp` without regenerating tiles. Delete `{output}.tmp` to force a clean restart.
 
 ## Performance
 

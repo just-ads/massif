@@ -93,10 +93,15 @@ pub(crate) struct Args {
     #[arg(long, allow_hyphen_values = true)]
     pub(crate) nodata: Option<f32>,
 
-    /// Minimum valid elevation value — values below this are treated as nodata.
-    /// Example: --min-valid -100.0  (all elevations < -100 become nodata)
+    /// Elevation threshold — values below this are encoded as 0.
+    /// Example: --zero-below -100.0  (all elevations < -100 are encoded as 0)
     #[arg(long, allow_hyphen_values = true)]
-    pub(crate) min_valid: Option<f32>,
+    pub(crate) zero_below: Option<f32>,
+
+    /// Fill all descendants of a uniform encoded tile with that tile's RGB value.
+    /// This is a lossy heuristic; local higher-zoom variation below the parent tile can be skipped.
+    #[arg(long)]
+    pub(crate) fill_uniform_descendants: bool,
 
     /// Worker thread count (default: all CPUs)
     #[arg(short = 'j', long)]
@@ -105,6 +110,14 @@ pub(crate) struct Args {
     /// Maximum source read buffer size per tile: 1024 is faster/smaller, 2048 is more conservative.
     #[arg(long, default_value = "2048", value_parser = parse_read_buffer_size)]
     pub(crate) read_buffer_size: usize,
+
+    /// PMTiles only: keep the temporary tile pyramid directory after writing the final archive.
+    #[arg(long)]
+    pub(crate) keep_temp: bool,
+
+    /// PMTiles only: skip tile generation and build the archive from the existing {output}.tmp tile pyramid.
+    #[arg(long)]
+    pub(crate) build_from_temp: bool,
 }
 
 fn main() -> Result<()> {
@@ -112,6 +125,10 @@ fn main() -> Result<()> {
 
     if args.min_z > args.max_z {
         bail!("--min-z must be <= --max-z");
+    }
+
+    if args.max_z > 31 {
+        bail!("--max-z must be <= 31 because tile coordinates are stored as u32");
     }
 
     if let Some(w) = args.workers {
@@ -122,6 +139,18 @@ fn main() -> Result<()> {
     }
 
     let output_kind = output_kind(&args.output)?;
+
+    if args.keep_temp && output_kind != OutputKind::Pmtiles {
+        bail!("--keep-temp is only supported for .pmtiles output");
+    }
+
+    if args.build_from_temp {
+        if output_kind != OutputKind::Pmtiles {
+            bail!("--build-from-temp is only supported for .pmtiles output");
+        }
+        return pmtiles::flow::build_from_temp(&args);
+    }
+
     let input_str = args
         .input
         .to_str()
