@@ -21,6 +21,7 @@ impl PmtilesWriter {
         let inner = PmTilesWriter::new(tile_type)
             .min_zoom(min_z)
             .max_zoom(max_z)
+            .center_zoom(min_z + (max_z - min_z) / 2)
             .create(f)
             .context("create PMTiles writer")?;
         Ok(Self { inner })
