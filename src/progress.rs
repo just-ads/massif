@@ -31,7 +31,7 @@ impl SingleProgress {
     fn new(generation_total: u64, generation_weight: usize, build_weight: usize) -> Self {
         let mut bar = tqdm!(
             total = PROGRESS_SCALE,
-            ncols = 32,
+            ncols = 16,
             dynamic_ncols = false,
             mininterval = 0.1,
             leave = false,
@@ -103,7 +103,7 @@ impl SingleProgress {
     fn set_stage<T: Into<String>>(&mut self, stage: T, stats: &TileStats) {
         self.bar.set_description(stage);
         self.bar.set_postfix(format!(
-            "written {} empty {} pruned {} filled {} elapsed {} eta {} speed {}/s",
+            "written {} | empty {} | pruned {} | filled {} | elapsed {} | eta {} | speed {}/s",
             format_count(stats.written),
             format_count(stats.empty),
             format_count(stats.pruned),
