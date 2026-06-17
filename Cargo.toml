@@ -14,6 +14,10 @@ exclude = ["docs/"]
 name = "massif"
 path = "src/main.rs"
 
+[[bin]]
+name = "massif-repair-pmtiles"
+path = "src/bin/massif_repair_pmtiles.rs"
+
 [dependencies]
 gdal = "0.19"
 rayon = "1"

@@ -59,6 +59,45 @@ pub fn uniform_fills_path(root: &Path) -> PathBuf {
     root.join("uniform_fills")
 }
 
+pub fn skipped_tiles_path(output: &Path) -> PathBuf {
+    append_suffix(output, ".skipped_pmtiles_tiles.log")
+}
+
+#[allow(dead_code)]
+pub fn read_skipped_tiles_log(path: &Path) -> Result<Vec<TileJob>> {
+    let file = File::open(path).with_context(|| format!("open {:?}", path))?;
+    let mut tiles = Vec::new();
+    let mut seen = HashSet::new();
+    for (line_no, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| format!("read {:?}:{}", path, line_no + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let z = parts
+            .next()
+            .with_context(|| format!("missing z in {:?}:{}", path, line_no + 1))?
+            .parse()
+            .with_context(|| format!("parse z in {:?}:{}", path, line_no + 1))?;
+        let x = parts
+            .next()
+            .with_context(|| format!("missing x in {:?}:{}", path, line_no + 1))?
+            .parse()
+            .with_context(|| format!("parse x in {:?}:{}", path, line_no + 1))?;
+        let y = parts
+            .next()
+            .with_context(|| format!("missing y in {:?}:{}", path, line_no + 1))?
+            .parse()
+            .with_context(|| format!("parse y in {:?}:{}", path, line_no + 1))?;
+        let tile = TileJob { z, x, y };
+        if seen.insert(tile_key(tile)) {
+            tiles.push(tile);
+        }
+    }
+    tiles.sort_by_key(|tile| pmtiles_tile_id(*tile).unwrap_or(tile_key(*tile)));
+    Ok(tiles)
+}
+
 pub fn zoom_dir(root: &Path, z: u8) -> PathBuf {
     root.join(format!("z{}", z))
 }
@@ -263,6 +302,17 @@ fn fill_descendants_by_zoom(
     Ok(by_zoom)
 }
 
+fn append_skipped_pmtiles_tile(output: &Path, tile: TileJob, path: &Path, reason: &str) -> Result<()> {
+    let log_path = skipped_tiles_path(output);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open {:?}", log_path))?;
+    writeln!(file, "{} {} {} {:?} {}", tile.z, tile.x, tile.y, path, reason)
+        .context("write skipped PMTiles tile log")
+}
+
 pub fn build_pmtiles_from_temp(
     root: &Path,
     output: &Path,
@@ -277,6 +327,10 @@ pub fn build_pmtiles_from_temp(
     let partial = partial_output(output);
     if partial.exists() {
         fs::remove_file(&partial).with_context(|| format!("remove existing {:?}", partial))?;
+    }
+    let skipped_tiles = skipped_tiles_path(output);
+    if skipped_tiles.exists() {
+        fs::remove_file(&skipped_tiles).with_context(|| format!("remove existing {:?}", skipped_tiles))?;
     }
     let mut writer = Writer::open(&partial, format, min_z, max_z)?;
     let mut n_written = 0;
@@ -317,15 +371,37 @@ pub fn build_pmtiles_from_temp(
 
             if take_file {
                 let (_, tile, path) = &files[file_i];
-                let data = fs::read(path).with_context(|| format!("read {:?}", path))?;
+                let data = match fs::read(path) {
+                    Ok(data) => data,
+                    Err(err) => {
+                        let reason = format!("read_failed: {}", err);
+                        if let Err(log_err) = append_skipped_pmtiles_tile(output, *tile, path, &reason) {
+                            eprintln!("Failed to record skipped PMTiles tile {:?}: {}", path, log_err);
+                        }
+                        eprintln!(
+                            "Skipping unreadable PMTiles temp tile {}/{}/{} from {:?}: {}",
+                            tile.z, tile.x, tile.y, path, err
+                        );
+                        file_i += 1;
+                        if let Some(progress) = progress.as_deref_mut() {
+                            progress.advance_build(1, stats);
+                        }
+                        continue;
+                    }
+                };
                 if data.is_empty() {
-                    bail!(
-                        "refusing to add empty PMTiles tile {}/{}/{} from {:?}",
-                        tile.z,
-                        tile.x,
-                        tile.y,
-                        path
+                    if let Err(log_err) = append_skipped_pmtiles_tile(output, *tile, path, "empty_or_corrupt") {
+                        eprintln!("Failed to record skipped PMTiles tile {:?}: {}", path, log_err);
+                    }
+                    eprintln!(
+                        "Skipping empty/corrupt PMTiles temp tile {}/{}/{} from {:?}",
+                        tile.z, tile.x, tile.y, path
                     );
+                    file_i += 1;
+                    if let Some(progress) = progress.as_deref_mut() {
+                        progress.advance_build(1, stats);
+                    }
+                    continue;
                 }
                 writer
                     .add_tile(tile.z, tile.x, tile.y, &data)

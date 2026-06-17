@@ -140,7 +140,21 @@ PMTiles and MBTiles support interrupted runs differently:
 
 With `--fill-uniform-descendants`, resume remains output-correct. PMTiles persists fill rules and skips child expansion for restored uniform roots when the rule exists; if a crash happens between writing a root tile and recording its fill rule, massif safely falls back to normal child processing for that subtree. MBTiles commits uniform roots and descendants atomically, but resumed runs may still enqueue already-filled descendants for existing-tile checks because MBTiles does not currently persist uniform-root metadata; this affects resume speed and intermediate statistics, not tile correctness.
 
-For PMTiles, use `--keep-temp` to retain the completed `{output}.tmp` tile pyramid after the archive is written. Use `--build-from-temp` to rebuild the `.pmtiles` archive from an existing `{output}.tmp` without regenerating tiles. Delete `{output}.tmp` to force a clean restart.
+For PMTiles, use `--keep-temp` to retain the completed `{output}.tmp` tile pyramid after the archive is written. Use `--build-from-temp` to rebuild the `.pmtiles` archive from an existing `{output}.tmp` without regenerating tiles. If final PMTiles writing skipped unreadable or empty temp tiles, massif records them in `{output}.skipped_pmtiles_tiles.log` and keeps `{output}.tmp` for repair; after fixing the source/read issue, use the separate `massif-repair-pmtiles` CLI to regenerate only those tiles into the existing temp pyramid and rebuild the final `.pmtiles` in the same run. Delete `{output}.tmp` to force a clean restart.
+
+### Repair skipped PMTiles tiles
+
+`massif-repair-pmtiles` is a separate CLI entry point for repairing skipped PMTiles temp tiles and rebuilding the final archive:
+
+```bash
+massif-repair-pmtiles input.tif output.pmtiles --keep-temp
+```
+
+By default it reads `{output}.skipped_pmtiles_tiles.log`. Use `--skipped-tiles-log PATH` to override the log path. The encoding, zoom, compression, nodata, and read-buffer options should match the original `massif` run. Build it as a standalone executable with:
+
+```bash
+cargo build --release --bin massif-repair-pmtiles
+```
 
 ## Performance
 

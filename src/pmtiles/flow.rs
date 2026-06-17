@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
@@ -66,6 +67,113 @@ pub(crate) fn build_from_temp(args: &Args) -> Result<()> {
         &total,
     )?;
     spool::write_state(&temp_root, &state_for(args, "done", args.max_z))?;
+
+    let sz = fs::metadata(&args.output)?.len();
+    eprintln!(
+        "Written {:?}  ({:.1} MB, {} tiles)",
+        args.output,
+        sz as f64 / 1_048_576.0,
+        written
+    );
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn regenerate_skipped_tiles(args: &Args, input_str: &str, log_path: Option<&Path>) -> Result<()> {
+    let log_path = log_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| spool::skipped_tiles_path(&args.output));
+    let tiles = spool::read_skipped_tiles_log(&log_path)?;
+    if tiles.is_empty() {
+        eprintln!("No skipped PMTiles tiles found in {:?}", log_path);
+        return Ok(());
+    }
+    if let Some(tile) = tiles.iter().find(|tile| tile.z < args.min_z || tile.z > args.max_z) {
+        bail!(
+            "skipped tile {}/{}/{} is outside --min-z/--max-z ({}-{})",
+            tile.z,
+            tile.x,
+            tile.y,
+            args.min_z,
+            args.max_z
+        );
+    }
+
+    let temp_root = spool::temp_root(&args.output);
+    if !temp_root.exists() {
+        bail!(
+            "PMTiles temp tile pyramid does not exist: {:?}; cannot rebuild the full output archive from only the skipped tile log",
+            temp_root
+        );
+    }
+    for z in args.min_z..=args.max_z {
+        if tiles.iter().any(|tile| tile.z == z) {
+            spool::prepare_zoom_write_dir(&temp_root, z)?;
+        }
+    }
+
+    let chunk_size = 4096usize;
+    let mut total = TileStats::default();
+    eprintln!(
+        "Regenerating {} skipped PMTiles tiles from {:?} into {:?}",
+        tiles.len(),
+        log_path,
+        temp_root
+    );
+
+    for chunk in tiles.chunks(chunk_size) {
+        process_tiles_stream(args, input_str, chunk, |result| {
+            total.add_checked();
+            match result {
+                TileOutcome::Data { coord, data, .. } => {
+                    spool::write_temp_tile(&temp_root, coord, &data)?;
+                    total.add_written();
+                }
+                TileOutcome::Empty { coord } => {
+                    eprintln!(
+                        "Warning: regenerated skipped PMTiles tile {}/{}/{} is empty; not written",
+                        coord.z, coord.x, coord.y
+                    );
+                    total.add_empty();
+                }
+                TileOutcome::Error { coord, error } => {
+                    eprintln!(
+                        "Warning: skipped PMTiles tile {}/{}/{} failed again: {:#}",
+                        coord.z, coord.x, coord.y, error
+                    );
+                    total.add_error();
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    eprintln!(
+        "Regenerated {} tiles into {:?} ({} empty, {} errors)",
+        total.written, temp_root, total.empty, total.errors
+    );
+
+    let (west_lon, south_lat, east_lon, north_lat) = dataset_wgs84_bounds(&args.input)?;
+    let tile_bounds = bounds_by_zoom(west_lon, south_lat, east_lon, north_lat, args.min_z, args.max_z);
+    spool::write_state(&temp_root, &state_for(args, "writing_pmtiles", args.max_z))?;
+    let written = spool::build_pmtiles_from_temp(
+        &temp_root,
+        &args.output,
+        args.format,
+        args.compress,
+        args.min_z,
+        args.max_z,
+        &tile_bounds,
+        None,
+        &total,
+    )?;
+    spool::write_state(&temp_root, &state_for(args, "done", args.max_z))?;
+    let skipped_tiles = spool::skipped_tiles_path(&args.output);
+    if args.keep_temp || skipped_tiles.exists() {
+        eprintln!("Kept PMTiles temp tile pyramid: {:?}", temp_root);
+    } else {
+        fs::remove_dir_all(&temp_root).with_context(|| format!("remove {:?}", temp_root))?;
+    }
 
     let sz = fs::metadata(&args.output)?.len();
     eprintln!(
@@ -272,7 +380,8 @@ pub(crate) fn run(
     )?;
     progress.finish(&total);
     spool::write_state(&temp_root, &state_for(args, "done", args.max_z))?;
-    if args.keep_temp {
+    let skipped_tiles = spool::skipped_tiles_path(&args.output);
+    if args.keep_temp || skipped_tiles.exists() {
         eprintln!("Kept PMTiles temp tile pyramid: {:?}", temp_root);
     } else {
         fs::remove_dir_all(&temp_root).with_context(|| format!("remove {:?}", temp_root))?;
